@@ -22,6 +22,7 @@ import httpx
 from starlette.responses import StreamingResponse
 
 from . import hooks
+from .nonce import NONCE, NONCE_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -49,15 +50,27 @@ async def process(raw_body: dict, headers: dict):
 
 
 def _build_forward_headers(headers: dict) -> dict:
-    """Pass through x-openclaw-* headers, override auth."""
+    """
+    Pass through all headers transparently, except:
+    - authorization    → replaced with our own bearer token
+    - content-length   → recalculated by httpx (body may have been transformed)
+    - host             → must be upstream host, not client's
+    - transfer-encoding, connection, keep-alive → hop-by-hop, breaks proxies
+    - cookie           → security: don't leak client session cookies upstream
+    """
+    _STRIP = {
+        "authorization", "content-length", "host",
+        "transfer-encoding", "connection", "keep-alive", "cookie",
+    }
     passthrough = {
         k: v for k, v in headers.items()
-        if k.lower().startswith("x-openclaw")
+        if k.lower() not in _STRIP
     }
     return {
         **passthrough,
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LLM_API_KEY}",
+        NONCE_HEADER: NONCE,  # loopback detection
     }
 
 

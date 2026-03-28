@@ -1,0 +1,32 @@
+# Project Directories
+data/
+notes/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Env
+.env
+.env.*
+*.env
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.clinerules/
+
+# Logs
+logs/
+
+# Docker
+*.log
+test-compose.yml
+docker-compose.yml
+!docker-compose.example.yml

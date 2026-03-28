@@ -1,0 +1,16 @@
+fastapi
+psycopg2-binary
+pandas>=2.0.0
+requests
+python-dotenv
+uvicorn
+mcp[server]>=1.0.0
+pydantic
+pydantic-settings
+openai>=1.3.0
+httpx
+starlette
+cryptography>=41.0.0
+argon2-cffi>=23.1.0
+jinja2>=3.1.0
+aiofiles>=23.0.0

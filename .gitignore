@@ -30,6 +30,10 @@ config.yml
 # Logs
 logs/
 
+# User plugins (bind-mounted volume, not tracked in git)
+# Directory created automatically by docker-compose volume mount
+plugins/user/
+
 # Docker
 *.log
 test-compose.yml

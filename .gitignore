@@ -1,6 +1,7 @@
 # Project Directories
 data/
 notes/
+.obsidian/
 
 # Python
 __pycache__/

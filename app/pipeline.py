@@ -30,11 +30,15 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")
 
 
-async def process(raw_body: dict, headers: dict):
+async def process(raw_body: dict, headers: dict, ctx=None):
     """Returns either a dict (non-streaming) or a StreamingResponse."""
 
     # 1. Notify plugins: request arrived
     await hooks.fire("before_request", raw_body, headers)
+
+    # Inject per-user client_mode for plugins (falls back to env var in plugins if absent)
+    if ctx:
+        headers = {**headers, "x-bridge-client-mode": ctx.client_mode}
 
     # 2. Let plugins transform the request (passthrough: no-op by default)
     body = await hooks.apply("process_request", raw_body, headers)
@@ -42,14 +46,14 @@ async def process(raw_body: dict, headers: dict):
     is_streaming = body.get("stream", False)
 
     if is_streaming:
-        return await _forward_stream(body, headers)
+        return await _forward_stream(body, headers, ctx)
     else:
-        response = await _forward(body, headers)
+        response = await _forward(body, headers, ctx)
         await hooks.fire("after_response", body, response)
         return response
 
 
-def _build_forward_headers(headers: dict) -> dict:
+def _build_forward_headers(headers: dict, ctx=None) -> dict:
     """
     Pass through all headers transparently, except:
     - authorization    → replaced with our own bearer token
@@ -66,21 +70,29 @@ def _build_forward_headers(headers: dict) -> dict:
         k: v for k, v in headers.items()
         if k.lower() not in _STRIP
     }
-    return {
+    token = ctx.endpoint_token if ctx else LLM_API_KEY
+    forward = {
         **passthrough,
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Authorization": f"Bearer {token}",
         NONCE_HEADER: NONCE,  # loopback detection
     }
+    if ctx and ctx.session_key:
+        forward["x-openclaw-session-key"] = ctx.session_key
+    return forward
 
 
-async def _forward(body: dict, headers: dict) -> dict:
+async def _forward(body: dict, headers: dict, ctx=None) -> dict:
     """Non-streaming forward — returns parsed JSON dict."""
-    forward_headers = _build_forward_headers(headers)
+    forward_headers = _build_forward_headers(headers, ctx)
+    url = ctx.endpoint_url if ctx else LLM_BASE_URL
+
+    if ctx and ctx.endpoint_model:
+        body = {**body, "model": ctx.endpoint_model}
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(
-            f"{LLM_BASE_URL}/chat/completions",
+            f"{url}/chat/completions",
             json=body,
             headers=forward_headers,
         )
@@ -90,15 +102,19 @@ async def _forward(body: dict, headers: dict) -> dict:
         return r.json()
 
 
-async def _forward_stream(body: dict, headers: dict) -> StreamingResponse:
+async def _forward_stream(body: dict, headers: dict, ctx=None) -> StreamingResponse:
     """Streaming forward — proxies SSE straight back to client."""
-    forward_headers = _build_forward_headers(headers)
+    forward_headers = _build_forward_headers(headers, ctx)
+    url = ctx.endpoint_url if ctx else LLM_BASE_URL
+
+    if ctx and ctx.endpoint_model:
+        body = {**body, "model": ctx.endpoint_model}
 
     async def stream_generator() -> AsyncIterator[bytes]:
         async with httpx.AsyncClient(timeout=120.0) as client:
             async with client.stream(
                 "POST",
-                f"{LLM_BASE_URL}/chat/completions",
+                f"{url}/chat/completions",
                 json=body,
                 headers=forward_headers,
             ) as r:

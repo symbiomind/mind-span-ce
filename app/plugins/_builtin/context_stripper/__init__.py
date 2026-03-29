@@ -51,14 +51,15 @@ _STRATEGIES = {
 
 @hooks.filter_hook("process_request", priority=5)
 def strip_context(body: dict, headers: dict) -> dict:
-    if CLIENT_MODE == "raw" or CLIENT_MODE not in _STRATEGIES:
+    client_mode = headers.get("x-bridge-client-mode", CLIENT_MODE)
+    if client_mode == "raw" or client_mode not in _STRATEGIES:
         return body
 
     messages = body.get("messages", [])
     if not messages:
         return body
 
-    stripped = _STRATEGIES[CLIENT_MODE](messages)
-    logger.info(f"context_stripper [{CLIENT_MODE}]: {len(messages)} messages → {len(stripped)}")
+    stripped = _STRATEGIES[client_mode](messages)
+    logger.info(f"context_stripper [{client_mode}]: {len(messages)} messages → {len(stripped)}")
 
     return {**body, "messages": stripped}

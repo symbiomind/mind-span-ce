@@ -1,4 +1,5 @@
 fastapi
+pyyaml
 psycopg2-binary
 pandas>=2.0.0
 requests

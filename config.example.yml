@@ -1,54 +1,56 @@
 server:
-  # agent: the AI agent this bridge serves
-  agent:
-    name: Lyra  # name presented to the LLM provider
-    # Default endpoint — can be overridden per role
-    endpoint:
-      plugins:
-        OpenAI-Provider:
-          url: http://your-openclaw-host:port/v1
-          auth: Bearer         # Bearer or oAuth
-          token: ${BRIDGE_API_TOKEN}  # set in .env
-          model: openclaw/main
-          # headers: # future use — passthru by default
-          #  allow:
-          #  deny:
-          #  insert:
+  # resource: keyed by resource id (the lookup name used internally)
+  # In the CE edition, resource = the provider endpoint + persona you're presenting.
+  # In the SaaS edition, a user can have many roles across many resources.
+  resource:
+    lyra:
+      name: Lyra  # display name presented to the LLM provider
+      # Default endpoint for this resource — can be overridden per role
+      endpoint:
+        plugins:
+          OpenAI-Provider:
+            url: http://your-openclaw-host:port/v1
+            auth: Bearer         # Bearer or oAuth (not both)
+            token: ${BRIDGE_API_TOKEN}  # set in .env
+            model: openclaw/main
+            # headers: # future use — passthru by default
+            #  allow:
+            #  deny:
+            #  insert:
 
-    roles:
-      mainSession:
-        # Uncomment to override the default endpoint for this role
-        # endpoint:
-        #   plugins:
-        #     OpenAI-Provider:
-        #       model: openclaw/main:custom
-        session:
-          plugins:
-            memory-mcp-ce:
-              url: http://your-memory-mcp-ce-host:port
-              auth: Bearer     # Bearer or oAuth
-              token: ${MEMORY_API_TOKEN}  # set in .env
-              options:
-                source: agent:lyra:main
-                # num_results: 5
-                # labels: ""
+      roles:
+        mainSession:
+          # Uncomment to override the default endpoint for this role
+          # endpoint:
+          #   plugins:
+          #     OpenAI-Provider:
+          #       model: openclaw/main:custom
+          session:
+            plugins:
+              memory-mcp-ce:
+                url: http://your-memory-mcp-ce-host:port
+                auth: Bearer     # Bearer or oAuth (not both)
+                token: ${MEMORY_API_TOKEN}  # set in .env
+                options:
+                  source: agent:lyra:main
+                  # num_results: 5
 
-      cron:
-        endpoint:
-          plugins:
-            OpenAI-Provider:
-              url: http://your-openclaw-host:port/v1
-              auth: Bearer
-              token: ${BRIDGE_CRON_TOKEN}  # set in .env
-              model: openclaw/main:cron
+        cron:
+          endpoint:
+            plugins:
+              OpenAI-Provider:
+                url: http://your-openclaw-host:port/v1
+                auth: Bearer
+                token: ${BRIDGE_CRON_TOKEN}  # set in .env
+                model: openclaw/main:cron
 
-    users:
-      # Users map to roles — token authenticates this bridge connection
-      YourName:
-        name: YourName
-        role: mainSession
-        token: ${USER_MAIN_TOKEN}  # set in .env
-      LyraCron:
-        name: system-cron-event
-        role: cron
-        token: ${USER_CRON_TOKEN}  # set in .env
+      users:
+        # Users map to roles — their token authenticates this bridge connection
+        YourName:
+          name: YourName
+          role: mainSession
+          token: ${USER_MAIN_TOKEN}  # set in .env
+        LyraCron:
+          name: system-cron-event
+          role: cron
+          token: ${USER_CRON_TOKEN}  # set in .env

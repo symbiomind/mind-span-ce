@@ -15,6 +15,10 @@ __pycache__/
 *.env
 !.env.example
 
+# Config (contains tokens — use config.example.yml as template)
+config.yml
+!config.example.yml
+
 # IDE
 .vscode/
 .idea/

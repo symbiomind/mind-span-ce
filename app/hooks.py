@@ -71,7 +71,12 @@ async def fire(event: str, *args, **kwargs):
 
 
 async def apply(event: str, value, *args, **kwargs):
-    """Apply a filter — each handler transforms value, final result returned."""
+    """Apply a filter — each handler transforms value, final result returned.
+
+    Extra positional and keyword args are forwarded to every handler.
+    Plugins that don't declare them simply use **kwargs or ignore them.
+    e.g. hooks.apply("process_request", body, headers, ctx=ctx)
+    """
     for _, fn in _filters.get(event, []):
         try:
             import asyncio

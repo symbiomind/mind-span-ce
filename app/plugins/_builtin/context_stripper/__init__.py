@@ -50,7 +50,7 @@ _STRATEGIES = {
 
 
 @hooks.filter_hook("process_request", priority=5)
-def strip_context(body: dict, headers: dict) -> dict:
+def strip_context(body: dict, headers: dict, ctx=None) -> dict:
     client_mode = headers.get("x-bridge-client-mode", CLIENT_MODE)
     if client_mode == "raw" or client_mode not in _STRATEGIES:
         return body

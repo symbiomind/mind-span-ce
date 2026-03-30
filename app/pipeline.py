@@ -41,7 +41,8 @@ async def process(raw_body: dict, headers: dict, ctx=None):
         headers = {**headers, "x-bridge-client-mode": ctx.client_mode}
 
     # 2. Let plugins transform the request (passthrough: no-op by default)
-    body = await hooks.apply("process_request", raw_body, headers)
+    # ctx is passed as a keyword arg so plugins can gate on role/session config
+    body = await hooks.apply("process_request", raw_body, headers, ctx=ctx)
 
     is_streaming = body.get("stream", False)
 

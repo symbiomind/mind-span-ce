@@ -1,56 +1,93 @@
 server:
-  # resource: keyed by resource id (the lookup name used internally)
-  # In the CE edition, resource = the provider endpoint + persona you're presenting.
-  # In the SaaS edition, a user can have many roles across many resources.
-  resource:
-    lyra:
-      name: Lyra  # display name presented to the LLM provider
-      # Default endpoint for this resource — can be overridden per role
+  # Four clean concerns — each owns exactly one thing:
+  #
+  #   resources   = WHERE  — backend endpoint definition
+  #   sessions    = HOW    — conversation management (optional — omit to let backend own it)
+  #   roles       = WHAT   — plugins, capabilities, context injection
+  #   identities  = WHO    — token → identity → role → resource
+  #
+  # Full annotated reference: notes/config-idea.yml
+  # Locked design decisions: notes/ROADMAP.md
+  # Plugin interface: notes/PLUGIN-DESIGN.md
+  # ctx contract for plugin authors: notes/CONTEXT-SCHEMA.md
+
+  # ──────────────────────────────────────────────────────────────────
+  # RESOURCES — backend endpoints (WHERE requests are forwarded)
+  # ──────────────────────────────────────────────────────────────────
+  resources:
+    openclaw:
       endpoint:
         plugins:
           OpenAI-Provider:
             url: http://your-openclaw-host:port/v1
-            auth: Bearer         # Bearer or oAuth (not both)
-            token: ${BRIDGE_API_TOKEN}  # set in .env
-            model: openclaw/main
-            # headers: # future use — passthru by default
-            #  allow:
-            #  deny:
-            #  insert:
+            auth: Bearer
+            token: ${OPENCLAW_API_KEY}    # set in .env
 
-      roles:
-        mainSession:
-          # Uncomment to override the default endpoint for this role
-          # endpoint:
-          #   plugins:
-          #     OpenAI-Provider:
-          #       model: openclaw/main:custom
-          session:
-            plugins:
-              memory-mcp-ce:
-                url: http://your-memory-mcp-ce-host:port
-                auth: Bearer     # Bearer or oAuth (not both)
-                token: ${MEMORY_API_TOKEN}  # set in .env
-                options:
-                  source: agent:lyra:main
-                  # num_results: 5
+    # Example: direct Anthropic (future — not yet implemented)
+    # claude_direct:
+    #   endpoint:
+    #     plugins:
+    #       Anthropic-Provider:           # future provider plugin
+    #         model: claude-sonnet-4-6
+    #         token: ${ANTHROPIC_API_KEY}
 
-        cron:
-          endpoint:
-            plugins:
-              OpenAI-Provider:
-                url: http://your-openclaw-host:port/v1
-                auth: Bearer
-                token: ${BRIDGE_CRON_TOKEN}  # set in .env
-                model: openclaw/main:cron
+  # ──────────────────────────────────────────────────────────────────
+  # SESSIONS — conversation management (HOW history is managed)
+  # Optional. Omit if you want the backend to own the session.
+  # ──────────────────────────────────────────────────────────────────
+  # sessions:
+  #   main_session:
+  #     system_prompt: "You are..."    # bridge injects this (future: direct-provider mode)
+  #     store: true                    # retain turn history
+  #     history_window: 20             # how many turns to keep
 
-      users:
-        # Users map to roles — their token authenticates this bridge connection
-        YourName:
-          name: YourName
-          role: mainSession
-          token: ${USER_MAIN_TOKEN}  # set in .env
-        LyraCron:
-          name: system-cron-event
-          role: cron
-          token: ${USER_CRON_TOKEN}  # set in .env
+  # ──────────────────────────────────────────────────────────────────
+  # ROLES — capability sets (WHAT plugins and context run)
+  # ──────────────────────────────────────────────────────────────────
+  roles:
+    mainSession:
+      resource: openclaw           # references a key from resources: above
+      model: openclaw/main         # model override (optional)
+      # session: main_session      # reference a sessions: key (optional)
+      context:
+        plugins:
+          time_inject:
+            timezone: "Australia/Adelaide"   # any IANA timezone
+          # memory_recall:                   # future builtin plugin
+          #   num_results: 5
+          #   token: ${MEMORY_TOKEN}
+
+    cron_role:
+      resource: openclaw
+      model: openclaw/main
+      context:
+        plugins:
+          time_inject:
+            timezone: "Australia/Adelaide"
+          # intentionally no memory_recall — cron/automated callers skip memory
+
+  # ──────────────────────────────────────────────────────────────────
+  # IDENTITIES — who can call the bridge (WHO)
+  # ──────────────────────────────────────────────────────────────────
+  identities:
+    # Human caller — full context injection
+    YourName_main:
+      context:
+        name: YourName             # → <caller>YourName</caller>
+        trust: trusted             # → <caller trust="trusted">YourName</caller>
+      role: mainSession
+      token: ${USER_MAIN_TOKEN}    # set in .env — globally unique
+      client_mode: librechat       # strip LibreChat history injection
+
+    # Automated caller — minimal injection, no trace
+    system_cron:
+      context:
+        name: system_cron
+        trust: system
+      role: cron_role
+      token: ${CRON_TOKEN}         # set in .env — different token from above
+      # no client_mode — cron hits API directly
+
+    # client_mode values:
+    #   raw (default)  — trust whatever arrives, no stripping
+    #   librechat      — strip full history LibreChat sends each turn (keep last user msg only)

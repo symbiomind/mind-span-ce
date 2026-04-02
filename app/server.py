@@ -13,9 +13,9 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import plugin_loader
+from . import plugin_dispatch
 from .auth import get_request_ctx
-from .config import RequestContext, load_config
+from .config import IdentityContext, load_config
 from .nonce import NONCE, NONCE_HEADER
 from .pipeline import process
 
@@ -32,7 +32,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"Loopback nonce: {NONCE_HEADER}={NONCE}")
     load_config()
     logger.info("Loading plugins...")
-    plugin_loader.load_all()
+    builtin_dir = os.path.join(os.path.dirname(__file__), "plugins", "_builtin")
+    user_dir = os.path.join(os.path.dirname(__file__), "..", "plugins", "user")
+    plugin_dispatch.load_plugins(builtin_dir, user_dir)
     logger.info("mind-span-ce ready.")
     yield
     # Shutdown (nothing to clean up yet)
@@ -42,7 +44,7 @@ app = FastAPI(title="mind-span-ce", version="0.1.0", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, ctx: RequestContext | None = Depends(get_request_ctx)):
+async def chat_completions(request: Request, ctx: IdentityContext | None = Depends(get_request_ctx)):
     # Loopback detection — if our own nonce arrives, we're calling ourselves
     if request.headers.get(NONCE_HEADER) == NONCE:
         logger.error("Loopback detected! LLM_BASE_URL is pointing back at mind-span-ce. Check your .env.")

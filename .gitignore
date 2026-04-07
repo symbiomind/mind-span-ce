@@ -10,6 +10,9 @@ __pycache__/
 *.so
 .Python
 
+# temporary ignore:
+docs/
+
 # Env
 .env
 .env.*

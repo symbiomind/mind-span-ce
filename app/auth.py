@@ -1,35 +1,46 @@
 """
-Auth dependency for mind-span-ce.
+Auth utilities for mind-span-ce v0.2.
 
-Resolves the incoming Bearer token to an IdentityContext.
-If config is not loaded (zero-config mode), always returns None.
-If config is loaded and the token is not recognised, raises HTTP 401.
+Core auth is a thin utility — token → identity_key lookup only.
+The actual client-facing authentication (extracting the bearer token from an
+HTTP request, returning 401, etc.) is the responsibility of the server plugin
+that registered the route (e.g. OpenAI-Provider at identities.*.plugins).
+
+In v0.2 with no server plugins loaded, there are no /v1/* routes, so this
+module is referenced by pipeline.py for internal token resolution.
 """
 
 import logging
 
-from fastapi import HTTPException, Request
-
-from .config import IdentityContext, get_context_for_token, is_config_loaded
+from .config import get_identity_key_for_token
 
 logger = logging.getLogger(__name__)
 
 
-async def get_request_ctx(request: Request) -> IdentityContext | None:
-    """FastAPI dependency. Returns IdentityContext or None (→ .env fallback)."""
+def resolve_identity_from_token(token: str) -> str | None:
+    """
+    Look up a bearer token in the config token map.
 
-    # Zero-config mode: no config.yml loaded → pass through
-    if not is_config_loaded():
+    Returns the identity_key string if found, or None if the token is unknown.
+    Logs a warning on miss (useful for catching misconfigured clients).
+    """
+    identity_key = get_identity_key_for_token(token)
+    if identity_key is None:
+        logger.warning("Rejected request: unrecognised bearer token.")
+    return identity_key
+
+
+def extract_bearer_token(auth_header: str) -> str | None:
+    """
+    Extract the token from a 'Bearer <token>' Authorization header value.
+
+    Returns the token string, or None if the header is missing or malformed.
+    Server plugins call this when handling their own routes.
+    """
+    if not auth_header:
         return None
-
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-
+    lower = auth_header.lower()
+    if not lower.startswith("bearer "):
+        return None
     token = auth_header[len("bearer "):].strip()
-    ctx = get_context_for_token(token)
-    if ctx is None:
-        logger.warning("Rejected request: unrecognised token.")
-        raise HTTPException(status_code=401, detail="Unauthorized.")
-
-    return ctx
+    return token if token else None

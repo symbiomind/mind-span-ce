@@ -16,6 +16,8 @@ Output in bridge_context:
 import logging
 from datetime import datetime
 
+from app.context import PipelineCtx
+
 logger = logging.getLogger("mind_span.time_inject")
 
 try:
@@ -26,7 +28,7 @@ except ImportError:
 SUPPORTED_HOOKS = ["role.context", "identity.context"]
 
 
-def hook(hook_point: str, ctx: dict, config: dict) -> dict | None:
+def hook(hook_point: str, ctx: PipelineCtx, config: dict) -> PipelineCtx | None:
     tz_name = config.get("timezone", "UTC")
 
     try:
@@ -41,5 +43,5 @@ def hook(hook_point: str, ctx: dict, config: dict) -> dict | None:
     suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
     friendly = now.strftime(f"%A, {day}{suffix} %B %Y - %I:%M %p %Z")
 
-    ctx["bridge_context"]["current_time"] = friendly
+    ctx.bridge_context["current_time"] = friendly
     return ctx

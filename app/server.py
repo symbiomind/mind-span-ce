@@ -1,8 +1,15 @@
 """
-mind-span-ce — OpenAI-compatible proxy server.
+mind-span-ce v0.2 — plugin-native bridge server.
 
-Exposes: POST /v1/chat/completions
-Startup: loads config, loads all plugins, then starts FastAPI via uvicorn.
+The core server owns exactly one route:
+  GET /health — always responds 200, reports config_loaded status
+
+All other routes are registered by server plugins during the server.startup hook.
+Without a plugin that registers routes (e.g. OpenAI-Provider at server.plugins),
+there are no /v1/* or any other endpoints — and that is correct.
+
+"Not plugins bolted onto a system. A system made of plugins."
+  — Sonnet, 2026-04-01
 """
 
 import logging
@@ -10,14 +17,14 @@ import os
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 
-from . import plugin_dispatch
-from .auth import get_request_ctx
-from .config import IdentityContext, load_config
+from . import plugin_loader
+from .config import get_server_cfg, is_config_loaded, load_config
+from .context import StartupCtx
 from .nonce import NONCE, NONCE_HEADER
-from .pipeline import process
+from . import plugin_dispatcher
+from .config import _extract_plugin_list
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -28,40 +35,69 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # ── Startup ─────────────────────────────────────────────────────────────
+    logger.info(f"mind-span-ce v0.2 starting up...")
     logger.info(f"Loopback nonce: {NONCE_HEADER}={NONCE}")
+
     load_config()
-    logger.info("Loading plugins...")
+
     builtin_dir = os.path.join(os.path.dirname(__file__), "plugins", "_builtin")
     user_dir = os.path.join(os.path.dirname(__file__), "..", "plugins", "user")
-    plugin_dispatch.load_plugins(builtin_dir, user_dir)
+    logger.info("Loading plugins...")
+    plugin_loader.load_plugins(builtin_dir, user_dir)
+
+    if is_config_loaded():
+        # Fire server.startup hook — server plugins register routes here
+        server_cfg = get_server_cfg()
+        startup_plugin_list = _extract_plugin_list(server_cfg.get("plugins"))
+        if startup_plugin_list:
+            startup_ctx = StartupCtx(
+                app=app,
+                server_cfg=server_cfg,
+                nonce=NONCE,
+            )
+            plugin_dispatcher.dispatch("server.startup", startup_ctx, startup_plugin_list)
+            logger.info("Server startup hooks complete.")
+        else:
+            logger.info(
+                "No server plugins configured. "
+                "Add plugins under server.plugins in config.yml to register routes."
+            )
+    else:
+        logger.info(
+            "No config loaded — serving /health only. "
+            "Create a config.yml to enable routing."
+        )
+
     logger.info("mind-span-ce ready.")
     yield
-    # Shutdown (nothing to clean up yet)
+    # ── Shutdown ────────────────────────────────────────────────────────────
+    # Nothing to clean up in core — plugins handle their own teardown (future)
 
 
-app = FastAPI(title="mind-span-ce", version="0.1.0", lifespan=lifespan)
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request, ctx: IdentityContext | None = Depends(get_request_ctx)):
-    # Loopback detection — if our own nonce arrives, we're calling ourselves
-    if request.headers.get(NONCE_HEADER) == NONCE:
-        logger.error("Loopback detected! LLM_BASE_URL is pointing back at mind-span-ce. Check your .env.")
-        raise HTTPException(status_code=503, detail="Mind-span loopback detected. Check LLM_BASE_URL in your .env.")
-
-    body = await request.json()
-    headers = dict(request.headers)
-    response = await process(body, headers, ctx)
-    # process() returns either a StreamingResponse or a dict
-    if isinstance(response, dict):
-        return JSONResponse(content=response)
-    return response  # StreamingResponse passes through directly
+app = FastAPI(
+    title="mind-span-ce",
+    version="0.2.0",
+    lifespan=lifespan,
+    # Disable default OpenAPI docs — they'd only show /health which is misleading.
+    # Plugin-registered routes won't appear here anyway (added after startup).
+    docs_url=None,
+    redoc_url=None,
+)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "mind-span-ce"}
+    """
+    Always responds 200. Reports whether config.yml was loaded successfully.
+    Use config_loaded to confirm routing is available.
+    """
+    return {
+        "status": "ok",
+        "service": "mind-span-ce",
+        "version": "0.2.0",
+        "config_loaded": is_config_loaded(),
+    }
 
 
 if __name__ == "__main__":

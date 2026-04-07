@@ -1,23 +1,27 @@
 """
-Config loader for mind-span-ce.
+Config loader for mind-span-ce v0.2.
 
-Parses the four-layer config shape:
-  resources   = WHERE  — backend endpoint, auth, provider plugin
-  sessions    = HOW    — conversation management, system prompts, history
+Parses config.yml into raw config blocks accessible at request time.
+The four-layer config shape:
+
+  resources   = WHERE  — backend endpoint definition
+  sessions    = HOW    — conversation management (optional)
   roles       = WHAT   — plugins, capabilities, context injection
-  identities  = WHO    — token → identity → role → session → resource
+  identities  = WHO    — token → identity → roles → resource
 
-Builds a flat token → IdentityContext lookup at startup.
-Falls back gracefully to .env zero-config mode if config.yml is absent.
+Key design decisions vs v0.1:
+  - No IdentityContext dataclass — config is stored as raw dicts, context assembled at request time
+  - No endpoint pre-resolution — url/token are populated by resource.endpoint plugin at request time
+  - _TOKEN_MAP maps token → identity_key (string), not to a pre-built context object
+  - roles: [list] is the new shape (was single role:) — resolve_roles() returns a list
+  - name/trust sugar expansion happens in the pipeline, not here
 
-See notes/CONTEXT-SCHEMA.md for the ctx dict contract (used at request time).
-See notes/config-idea.yml for the target config shape.
+See docs/config.yml/README.md for the full config shape.
 """
 
 import logging
 import os
 import re
-from dataclasses import dataclass, field
 
 import yaml
 
@@ -25,34 +29,96 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.getenv("CONFIG_PATH", "/app/config.yml")
 
-_TOKEN_MAP: dict[str, "IdentityContext"] = {}
-_RAW_CONFIG: dict = {}
-_config_loaded = False
+_SERVER_CFG: dict = {}           # raw server: block, env vars expanded
+_TOKEN_MAP: dict[str, str] = {}  # bearer_token → identity_key
+_config_loaded: bool = False
 
 
-@dataclass
-class IdentityContext:
-    # Identity layer
-    identity_key: str
-    identity_name: str | None       # context.name → <caller>
-    identity_trust: str | None      # context.trust e.g. "trusted", "public"
-    client_mode: str                # "raw" | "librechat" | "openwebui"
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-    # Role layer
-    role_key: str
-    role_model: str | None
-    role_session: str | None        # None = backend owns session
+def load_config() -> None:
+    """
+    Parse config.yml and populate module state. Called once at startup.
 
-    # Resource layer
-    resource_key: str
-    endpoint_url: str
-    endpoint_token: str
+    On missing file: logs info (valid — no config = /health only mode).
+    On parse error: logs error, state remains unloaded.
+    On empty file: logs warning, state remains unloaded.
+    """
+    global _config_loaded, _SERVER_CFG, _TOKEN_MAP
 
-    # Pre-resolved plugin lists for fast dispatch at request time
-    # Each entry: (plugin_name, plugin_config_dict)
-    identity_context_plugins: list = field(default_factory=list)
-    role_context_plugins: list = field(default_factory=list)
+    if not os.path.exists(CONFIG_PATH):
+        logger.info(
+            f"No config file found at {CONFIG_PATH} — "
+            f"server will serve /health only. Create a config.yml to enable routing."
+        )
+        return
 
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            raw = yaml.safe_load(f)
+    except Exception as e:
+        logger.error(f"Failed to parse config file {CONFIG_PATH}: {e}")
+        return
+
+    if not raw:
+        logger.warning(f"Config file {CONFIG_PATH} is empty — serving /health only.")
+        return
+
+    try:
+        raw = _expand_env_vars(raw)
+        server = raw.get("server", {})
+        if not server:
+            logger.warning(f"Config file {CONFIG_PATH} has no 'server:' block — serving /health only.")
+            return
+
+        token_map = _build_token_map(server)
+        _SERVER_CFG = server
+        _TOKEN_MAP = token_map
+        _config_loaded = True
+        logger.info(f"Config loaded: {len(_TOKEN_MAP)} identity token(s) registered.")
+    except Exception as e:
+        logger.error(f"Config structure error in {CONFIG_PATH}: {e}")
+
+
+def is_config_loaded() -> bool:
+    return _config_loaded
+
+
+def get_identity_key_for_token(token: str) -> str | None:
+    """Returns the identity key for a bearer token, or None if not found."""
+    return _TOKEN_MAP.get(token)
+
+
+def get_server_cfg() -> dict:
+    """Returns the full parsed server: block (env vars already expanded)."""
+    return _SERVER_CFG
+
+
+def resolve_identity(key: str) -> dict | None:
+    """Returns the identity config block for a given key, or None."""
+    return _SERVER_CFG.get("identities", {}).get(key)
+
+
+def resolve_role(key: str) -> dict | None:
+    """Returns the role config block for a given key, or None."""
+    return _SERVER_CFG.get("roles", {}).get(key)
+
+
+def resolve_resource(key: str) -> dict | None:
+    """Returns the resource config block for a given key, or None."""
+    return _SERVER_CFG.get("resources", {}).get(key)
+
+
+def resolve_session(key: str) -> dict | None:
+    """Returns the session config block for a given key, or None. Sessions are optional."""
+    return _SERVER_CFG.get("sessions", {}).get(key)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def _expand_env_vars(obj):
     """Recursively expand ${VAR} in string values."""
@@ -76,6 +142,8 @@ def _extract_plugin_list(plugins_block) -> list[tuple[str, dict]]:
         memory_recall:
           enabled: true
     → [("time_inject", {"timezone": "..."}), ("memory_recall", {"enabled": True})]
+
+    Order is preserved — this IS the execution order.
     """
     if not plugins_block or not isinstance(plugins_block, dict):
         return []
@@ -89,41 +157,46 @@ def _extract_plugin_list(plugins_block) -> list[tuple[str, dict]]:
     return result
 
 
-def load_config() -> None:
-    """Parse config.yml and populate the token lookup. Called once at startup."""
-    global _config_loaded, _RAW_CONFIG
+def _get_identity_roles(identity_cfg: dict, identity_key: str) -> list[str]:
+    """
+    Extract the list of role keys from an identity config.
 
-    if not os.path.exists(CONFIG_PATH):
-        logger.warning(f"Config file not found at {CONFIG_PATH} — running in .env fallback mode.")
-        return
+    Supports both new shape (roles: [list]) and old shape (role: single).
+    Logs a warning for multi-role identities (only first will be used in v0.2).
+    """
+    # New shape: roles: [role_a, role_b]
+    roles = identity_cfg.get("roles")
+    if isinstance(roles, list):
+        if len(roles) > 1:
+            logger.warning(
+                f"Identity '{identity_key}' declares {len(roles)} roles — "
+                f"only the first role ('{roles[0]}') is used in v0.2 "
+                f"(multi-role fan-out is planned for a future version)."
+            )
+        return [r for r in roles if r]
 
-    try:
-        with open(CONFIG_PATH, "r") as f:
-            raw = yaml.safe_load(f)
-    except Exception as e:
-        logger.warning(f"Failed to parse config file {CONFIG_PATH}: {e} — running in .env fallback mode.")
-        return
+    # Old shape: role: single_role (backwards compat, log a hint)
+    role = identity_cfg.get("role")
+    if role:
+        logger.debug(
+            f"Identity '{identity_key}' uses old 'role:' key — "
+            f"consider updating to 'roles: [{role}]'."
+        )
+        return [role]
 
-    if not raw:
-        logger.warning(f"Config file {CONFIG_PATH} is empty — running in .env fallback mode.")
-        return
-
-    try:
-        raw = _expand_env_vars(raw)
-        _RAW_CONFIG = raw
-        _build_identity_map(raw)
-        _config_loaded = True
-        logger.info(f"Config loaded: {len(_TOKEN_MAP)} identity token(s) registered.")
-    except Exception as e:
-        logger.warning(f"Config structure error in {CONFIG_PATH}: {e} — running in .env fallback mode.")
+    return []
 
 
-def _build_identity_map(raw: dict) -> None:
-    server = raw.get("server", {})
-    resources = server.get("resources", {})
-    roles = server.get("roles", {})
-    identities = server.get("identities", {})
+def _build_token_map(server: dict) -> dict[str, str]:
+    """
+    Build the token → identity_key map from the server config block.
+    Invalid identities are excluded with warnings — startup always continues.
+    """
+    resources = server.get("resources", {}) or {}
+    roles = server.get("roles", {}) or {}
+    identities = server.get("identities", {}) or {}
 
+    token_map: dict[str, str] = {}
     seen_tokens: dict[str, str] = {}  # token → identity_key (for duplicate detection)
 
     for identity_key, identity_cfg in identities.items():
@@ -138,91 +211,40 @@ def _build_identity_map(raw: dict) -> None:
 
         if token in seen_tokens:
             logger.warning(
-                f"Duplicate token for identity '{identity_key}' — already registered to '{seen_tokens[token]}'. Skipping."
+                f"Identity '{identity_key}' has a duplicate token (already registered to "
+                f"'{seen_tokens[token]}') — skipping."
             )
             continue
-        seen_tokens[token] = identity_key
 
-        role_key = identity_cfg.get("role")
-        if not role_key:
-            logger.warning(f"Identity '{identity_key}' has no role — skipping.")
+        role_keys = _get_identity_roles(identity_cfg, identity_key)
+        if not role_keys:
+            logger.warning(f"Identity '{identity_key}' has no roles — skipping.")
             continue
 
+        # Validate the first role (the one that will actually be used)
+        role_key = role_keys[0]
         role_cfg = roles.get(role_key)
         if not role_cfg:
-            logger.warning(f"Identity '{identity_key}' references unknown role '{role_key}' — skipping.")
+            logger.warning(
+                f"Identity '{identity_key}' references unknown role '{role_key}' — skipping."
+            )
             continue
 
         resource_key = role_cfg.get("resource")
         if not resource_key:
-            logger.warning(f"Role '{role_key}' has no resource — skipping identity '{identity_key}'.")
+            logger.warning(
+                f"Role '{role_key}' (used by identity '{identity_key}') has no resource — skipping."
+            )
             continue
 
-        resource_cfg = resources.get(resource_key)
-        if not resource_cfg:
-            logger.warning(f"Role '{role_key}' references unknown resource '{resource_key}' — skipping identity '{identity_key}'.")
+        if resource_key not in resources:
+            logger.warning(
+                f"Role '{role_key}' references unknown resource '{resource_key}' — skipping identity '{identity_key}'."
+            )
             continue
 
-        # Resolve endpoint from resource
-        oai = resource_cfg.get("endpoint", {}).get("plugins", {}).get("OpenAI-Provider", {})
-        if not oai:
-            logger.warning(f"Resource '{resource_key}' has no OpenAI-Provider plugin config — skipping identity '{identity_key}'.")
-            continue
-
-        endpoint_url = oai.get("url")
-        endpoint_token = oai.get("token")
-        if not endpoint_url or not endpoint_token:
-            logger.warning(f"Resource '{resource_key}' OpenAI-Provider missing url or token — skipping identity '{identity_key}'.")
-            continue
-
-        # Context block (short-form sugar expanded here)
-        identity_context = identity_cfg.get("context", {}) or {}
-        identity_name = identity_context.get("name")
-        identity_trust = identity_context.get("trust")
-
-        # Build identity-level plugin list
-        # If name/trust are set, prepend caller_inject automatically (short-form sugar)
-        identity_plugins_raw = _extract_plugin_list(identity_context.get("plugins"))
-        if identity_name and not any(name == "caller_inject" for name, _ in identity_plugins_raw):
-            caller_config = {}
-            if identity_name:
-                caller_config["name"] = identity_name
-            if identity_trust:
-                caller_config["trust"] = identity_trust
-            identity_plugins = [("caller_inject", caller_config)] + identity_plugins_raw
-        else:
-            identity_plugins = identity_plugins_raw
-
-        # Build role-level plugin list (role.context.plugins)
-        role_context = role_cfg.get("context", {}) or {}
-        role_plugins = _extract_plugin_list(role_context.get("plugins"))
-
-        ctx = IdentityContext(
-            identity_key=identity_key,
-            identity_name=identity_name,
-            identity_trust=identity_trust,
-            client_mode=identity_cfg.get("client_mode", "raw"),
-            role_key=role_key,
-            role_model=role_cfg.get("model"),
-            role_session=role_cfg.get("session"),
-            resource_key=resource_key,
-            endpoint_url=endpoint_url,
-            endpoint_token=endpoint_token,
-            identity_context_plugins=identity_plugins,
-            role_context_plugins=role_plugins,
-        )
-        _TOKEN_MAP[token] = ctx
+        seen_tokens[token] = identity_key
+        token_map[token] = identity_key
         logger.debug(f"Registered token for '{identity_key}' → role '{role_key}' → resource '{resource_key}'")
 
-
-def get_context_for_token(token: str) -> "IdentityContext | None":
-    return _TOKEN_MAP.get(token)
-
-
-def get_full_config() -> dict:
-    """Returns the raw parsed config dict (env vars already expanded)."""
-    return _RAW_CONFIG
-
-
-def is_config_loaded() -> bool:
-    return _config_loaded
+    return token_map

@@ -345,6 +345,9 @@ async def _build_models_list(plugin_cfg: dict, resource_cfg: dict) -> list[dict]
     if models_cfg.get("fetch"):
         ep = (resource_cfg or {}).get("endpoint", {}).get("plugins", {}).get("OpenAI-Protocol", {})
         upstream = await _fetch_upstream_models(ep.get("url", ""), ep.get("token", ""))
+        if not alias_map:
+            # No allowed list — return full upstream list
+            return upstream
         upstream_ids = {m["id"] for m in upstream}
         seen, result = set(), []
         for alias_str, model_id in alias_map.items():

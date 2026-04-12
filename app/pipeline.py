@@ -20,13 +20,16 @@ Pipeline flow:
   12. Build outbound request body
   13. Build forward headers
   14. Forward to backend (streaming or non-streaming)
+  15. Fire "response.out" hook (after backend responds — ctx.response holds agent turn)
 
 ctx contract: see app/context.py
 Plugin interface: see notes/PLUGIN-DESIGN.md
 Hook points: see docs/config.yml/README.md
 """
 
+import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import AsyncIterator
 
 import httpx
@@ -169,14 +172,32 @@ async def process(
     # ── Step 13: Build forward headers ──────────────────────────────────────
     forward_headers = _build_forward_headers(inbound_headers, ctx)
 
-    # ── Step 14: Forward to backend ─────────────────────────────────────────
+    # ── Step 14+15: Forward to backend, then fire response.out hook ─────────
     is_streaming = outbound_body.get("stream", False)
     endpoint_url = ctx.resource.endpoint_url
 
+    response_out_plugin_list = _collect_response_out_plugins(role_cfg, identity_cfg)
+
     if is_streaming:
-        return await _forward_stream(endpoint_url, outbound_body, forward_headers)
+        on_complete = None
+        if response_out_plugin_list:
+            async def on_stream_complete(content: str | None) -> None:
+                ctx.response = {"role": "assistant", "content": content} if content is not None else None
+                _dispatch_response_out_bg(ctx, response_out_plugin_list)
+            on_complete = on_stream_complete
+
+        return await _forward_stream(endpoint_url, outbound_body, forward_headers, on_complete=on_complete)
     else:
-        return await _forward(endpoint_url, outbound_body, forward_headers)
+        result = await _forward(endpoint_url, outbound_body, forward_headers)
+
+        # ── Step 15: RESPONSE.OUT hook ───────────────────────────────────────
+        # Fires after upstream response. ctx.response holds the agent turn.
+        # Plugins (e.g. conversational_memory) use this to journal the pair.
+        if response_out_plugin_list:
+            ctx.response = _extract_response(result)
+            _dispatch_response_out_bg(ctx, response_out_plugin_list)
+
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +274,63 @@ def _build_ctx(
     )
 
 
+def _dispatch_response_out_bg(ctx: PipelineCtx, plugin_list: list) -> None:
+    """
+    Schedule response.out dispatch as a fire-and-forget background task.
+    Offloads the synchronous dispatch to a thread pool so the event loop
+    is not blocked by blocking I/O in plugins (e.g. conversational_memory).
+    """
+    loop = asyncio.get_event_loop()
+
+    async def _run() -> None:
+        try:
+            await loop.run_in_executor(
+                None, plugin_dispatcher.dispatch, "response.out", ctx, plugin_list
+            )
+        except Exception:
+            logger.exception("[response.out] background dispatch raised an exception")
+
+    asyncio.create_task(_run())
+
+
+def _collect_response_out_plugins(role_cfg: dict, identity_cfg: dict) -> list:
+    """
+    Gather plugins from role.context and identity.context that declare
+    "response.out" in their SUPPORTED_HOOKS. Preserves declaration order.
+    Role-context plugins run first, identity-context second.
+    """
+    from . import plugin_loader
+    result = []
+    for cfg_block in [
+        role_cfg.get("context", {}).get("plugins"),
+        identity_cfg.get("context", {}).get("plugins"),
+    ]:
+        for name, config in _extract_plugin_list(cfg_block):
+            plugin = plugin_loader.get_plugin(name)
+            if plugin and "response.out" in getattr(plugin, "SUPPORTED_HOOKS", []):
+                result.append((name, config))
+    return result
+
+
+def _extract_response(result: JSONResponse) -> dict | None:
+    """
+    Parse a JSONResponse from the backend and return the assistant turn.
+    Returns {"role": "assistant", "content": "<text>"} or None if unparseable.
+    """
+    try:
+        body = result.body
+        if isinstance(body, (bytes, bytearray)):
+            import json
+            data = json.loads(body)
+        else:
+            data = body
+        content = data["choices"][0]["message"]["content"]
+        return {"role": "assistant", "content": content}
+    except Exception:
+        logger.warning("response.out: could not extract assistant content from backend response")
+        return None
+
+
 def _sanitise_headers(headers: dict) -> dict:
     """Lowercase all header keys and strip hop-by-hop headers."""
     return {
@@ -311,9 +389,21 @@ async def _forward(url: str, body: dict, headers: dict) -> JSONResponse:
         return JSONResponse(content=r.json(), status_code=r.status_code)
 
 
-async def _forward_stream(url: str, body: dict, headers: dict) -> StreamingResponse:
-    """Streaming forward — proxies SSE bytes straight back to the client."""
+async def _forward_stream(
+    url: str,
+    body: dict,
+    headers: dict,
+    on_complete: "Callable[[str | None], Awaitable[None]] | None" = None,
+) -> StreamingResponse:
+    """
+    Streaming forward — buffers all SSE chunks, assembles full response text,
+    fires on_complete callback (for response.out hook), then yields buffered
+    chunks to the client. Client experience is identical to pass-through.
+    """
+    import json as _json
+
     async def stream_generator() -> AsyncIterator[bytes]:
+        chunks: list[bytes] = []
         async with httpx.AsyncClient(timeout=_FORWARD_TIMEOUT) as client:
             async with client.stream(
                 "POST",
@@ -327,13 +417,52 @@ async def _forward_stream(url: str, body: dict, headers: dict) -> StreamingRespo
                 )
                 r.raise_for_status()
                 async for chunk in r.aiter_bytes():
-                    yield chunk
+                    chunks.append(chunk)
+
+        # Reassemble SSE chunks into full agent text for response.out hook
+        if on_complete is not None:
+            content = _reassemble_sse(chunks)
+            await on_complete(content)
+
+        # Yield buffered chunks to client
+        for chunk in chunks:
+            yield chunk
 
     return StreamingResponse(
         stream_generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _reassemble_sse(chunks: list[bytes]) -> str | None:
+    """
+    Reassemble OpenAI-envelope SSE chunks into the full assistant text.
+    Parses data: {...} lines, extracts choices[0].delta.content fragments.
+    Returns concatenated text, or None if reassembly fails.
+    """
+    import json as _json
+
+    parts: list[str] = []
+    try:
+        raw = b"".join(chunks).decode("utf-8", errors="replace")
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            data = _json.loads(payload)
+            delta = data.get("choices", [{}])[0].get("delta", {})
+            fragment = delta.get("content")
+            if fragment:
+                parts.append(fragment)
+    except Exception:
+        logger.warning("response.out: SSE reassembly failed — response.out will receive None")
+        return None
+
+    return "".join(parts) if parts else None
 
 
 # ---------------------------------------------------------------------------

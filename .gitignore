@@ -2,6 +2,7 @@
 data/
 notes/
 .obsidian/
+.claude/
 
 # Python
 __pycache__/

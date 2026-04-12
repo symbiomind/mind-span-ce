@@ -1,1 +1,17 @@
-
+services:
+  mind-span-ce:
+    build: .
+    ports:
+      - "5005:5005"
+    env_file:
+      - .env
+    volumes:
+      # config.yml — four-layer routing: resources, roles, identities, plugins
+      - ./config.yml:/app/config.yml:ro
+      # User plugins — drop .py files here to extend at runtime without rebuilding
+      - ./plugins/user:/app/app/plugins/user
+      # Persistent logs
+      - ./logs:/app/logs
+      # conversational_memory shown-state (per-agent deduplication tracking)
+      - ./data:/app/data
+    restart: unless-stopped

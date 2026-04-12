@@ -4,3 +4,4 @@ httpx
 pyyaml
 python-dotenv
 openai
+mcp

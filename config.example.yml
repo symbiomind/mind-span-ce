@@ -2,92 +2,162 @@ server:
   # Four clean concerns — each owns exactly one thing:
   #
   #   resources   = WHERE  — backend endpoint definition
-  #   sessions    = HOW    — conversation management (optional — omit to let backend own it)
   #   roles       = WHAT   — plugins, capabilities, context injection
   #   identities  = WHO    — token → identity → role → resource
   #
   # Full annotated reference: notes/config-idea.yml
   # Locked design decisions: notes/ROADMAP.md
   # Plugin interface: notes/PLUGIN-DESIGN.md
-  # ctx contract for plugin authors: notes/CONTEXT-SCHEMA.md
+  # Context contract for plugin authors: notes/CONTEXT-SCHEMA.md
 
   # ──────────────────────────────────────────────────────────────────
-  # RESOURCES — backend endpoints (WHERE requests are forwarded)
+  # PLUGINS (top-level) — global transport / protocol bindings
+  # ──────────────────────────────────────────────────────────────────
+  plugins:
+    OpenAI-Protocol:
+      prefix: /v1                      # all /v1/chat/completions etc served here
+
+  # ──────────────────────────────────────────────────────────────────
+  # RESOURCES — backends + services the bridge can reach (WHERE)
   # ──────────────────────────────────────────────────────────────────
   resources:
+
+    # ── AI backends ───────────────────────────────────────────────
     openclaw:
       endpoint:
         plugins:
-          OpenAI-Provider:
+          OpenAI-Protocol:
             url: http://your-openclaw-host:port/v1
             auth: Bearer
-            token: ${OPENCLAW_API_KEY}    # set in .env
+            token: ${OPENCLAW_API_KEY}       # set in .env
 
-    # Example: direct Anthropic (future — not yet implemented)
-    # claude_direct:
-    #   endpoint:
-    #     plugins:
-    #       Anthropic-Provider:           # future provider plugin
-    #         model: claude-sonnet-4-6
-    #         token: ${ANTHROPIC_API_KEY}
+    openrouter:
+      endpoint:
+        plugins:
+          OpenAI-Protocol:
+            url: https://openrouter.ai/api/v1
+            auth: Bearer
+            token: ${OPENROUTER_API_KEY}
+
+    local-ollama:
+      endpoint:
+        plugins:
+          OpenAI-Protocol:
+            url: http://ollama:11434/v1      # adjust host for your setup
+            auth: Bearer
+            token: ollama                    # Ollama ignores the token value
+
+    # ── Service resources ─────────────────────────────────────────
+    # memory-mcp-ce — required by the conversational_memory builtin plugin
+    memory_mcp:
+      endpoint_url: http://memory-mcp-ce:8080/mcp
+      token: ${MEMORY_MCP_TOKEN}
 
   # ──────────────────────────────────────────────────────────────────
-  # SESSIONS — conversation management (HOW history is managed)
-  # Optional. Omit if you want the backend to own the session.
-  # ──────────────────────────────────────────────────────────────────
-  # sessions:
-  #   main_session:
-  #     system_prompt: "You are..."    # bridge injects this (future: direct-provider mode)
-  #     store: true                    # retain turn history
-  #     history_window: 20             # how many turns to keep
-
-  # ──────────────────────────────────────────────────────────────────
-  # ROLES — capability sets (WHAT plugins and context run)
+  # ROLES — what each session does (WHAT plugins and context run)
   # ──────────────────────────────────────────────────────────────────
   roles:
-    mainSession:
-      resource: openclaw           # references a key from resources: above
-      model: openclaw/main         # model override (optional)
-      # session: main_session      # reference a sessions: key (optional)
+
+    # ── A named OpenClaw agent with full memory ────────────────────
+    crabbySession:
+      resource: openclaw
+      plugins:
+        OpenAI-Protocol:
+          model: openclaw/crabby               # fixed model for this role
+          headers:                             # optional upstream headers
+            x-openclaw-session-key: "agent:crabby:main"
+            x-openclaw-message-channel: "main"
       context:
         plugins:
           time_inject:
-            timezone: "Australia/Adelaide"   # any IANA timezone
-          # memory_recall:                   # future builtin plugin
-          #   num_results: 5
-          #   token: ${MEMORY_TOKEN}
+            timezone: "Australia/Adelaide"     # any IANA timezone
+          conversational_memory:
+            resource: memory_mcp              # references resources: above
+            agent_alias: Crabby               # prefix for source tagging + recall display
+            num_results: 2                    # memories to surface per turn
+            threshold: 0.50                   # minimum similarity (0.0–1.0)
+            # nonce: 52868312778495           # optional — stable label for unenriched memories
+            # decay_minutes: 60              # optional — re-surface after N minutes
 
-    cron_role:
-      resource: openclaw
-      model: openclaw/main
+    # ── OpenRouter with dynamic model selection ────────────────────
+    openrouterSession:
+      resource: openrouter
+      plugins:
+        OpenAI-Protocol:
+          models:
+            fetch: true                       # expose full upstream model list at /v1/models
+            # default: qwen/qwen3-coder-next  # optional default model
+            # allowed:                        # optional allowlist
+            #   - qwen/qwen3-coder-next
+            #   - [gpt, openai/gpt-4o]        # [alias, model-id] for short-form naming
+            #   - [sonnet, anthropic/claude-sonnet-4-6]
       context:
         plugins:
           time_inject:
             timezone: "Australia/Adelaide"
-          # intentionally no memory_recall — cron/automated callers skip memory
+
+    # ── Local Ollama — no memory, no context overhead ─────────────
+    localSession:
+      resource: local-ollama
+      plugins:
+        OpenAI-Protocol:
+          model: llama3.2:3b                  # change to whatever you have pulled
+      context:
+        plugins:
+          time_inject:
+            timezone: "Australia/Adelaide"
 
   # ──────────────────────────────────────────────────────────────────
-  # IDENTITIES — who can call the bridge (WHO)
+  # IDENTITIES — who can call the bridge (WHO → role + context)
   # ──────────────────────────────────────────────────────────────────
   identities:
-    # Human caller — full context injection
-    YourName_main:
-      context:
-        name: YourName             # → <caller>YourName</caller>
-        trust: trusted             # → <caller trust="trusted">YourName</caller>
-      role: mainSession
-      token: ${USER_MAIN_TOKEN}    # set in .env — globally unique
-      client_mode: librechat       # strip LibreChat history injection
 
-    # Automated caller — minimal injection, no trace
-    system_cron:
+    # ── Human caller — full context injection, LibreChat client ───
+    YourName_crabby:
       context:
-        name: system_cron
-        trust: system
-      role: cron_role
-      token: ${CRON_TOKEN}         # set in .env — different token from above
-      # no client_mode — cron hits API directly
+        name: YourName                        # → <caller trust="trusted">YourName</caller>
+        trust: trusted
+        plugins:
+          context_stripper:
+            client_mode: librechat            # strip full-history re-injection LibreChat sends
+      role: crabbySession
+      token: ${CRABBY_YOURNAME}              # set in .env — globally unique
 
-    # client_mode values:
-    #   raw (default)  — trust whatever arrives, no stripping
-    #   librechat      — strip full history LibreChat sends each turn (keep last user msg only)
+    YourName_openrouter:
+      context:
+        name: YourName
+        trust: trusted
+        plugins:
+          context_stripper:
+            client_mode: librechat
+      role: openrouterSession
+      token: ${OPENROUTER_TOKEN}
+
+    YourName_local:
+      context:
+        name: YourName
+        trust: trusted
+      role: localSession
+      token: ${LOCAL_YOURNAME}
+
+    # ── Automated / system caller — minimal injection, no stripping ─
+    # system_cron:
+    #   context:
+    #     name: system_cron
+    #     trust: system
+    #   role: localSession
+    #   token: ${CRON_TOKEN}
+
+  # ──────────────────────────────────────────────────────────────────
+  # NOTES
+  # ──────────────────────────────────────────────────────────────────
+  # client_mode values (context_stripper plugin):
+  #   raw (default)  — trust whatever arrives, no stripping
+  #   librechat      — strip full history LibreChat sends each turn (keep last user msg only)
+  #   openwebui      — strip OpenWebUI injection patterns
+  #
+  # trust values (caller_inject plugin):
+  #   trusted        — human, known identity
+  #   public         — unauthenticated / external caller
+  #   system         — automated / cron caller
+  #   operator       — infrastructure-level override

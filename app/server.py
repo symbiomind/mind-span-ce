@@ -49,20 +49,26 @@ async def lifespan(app: FastAPI):
     if is_config_loaded():
         # Fire server.startup hook — server plugins register routes here
         server_cfg = get_server_cfg()
+        startup_ctx = StartupCtx(
+            app=app,
+            server_cfg=server_cfg,
+            nonce=NONCE,
+        )
         startup_plugin_list = _extract_plugin_list(server_cfg.get("plugins"))
         if startup_plugin_list:
-            startup_ctx = StartupCtx(
-                app=app,
-                server_cfg=server_cfg,
-                nonce=NONCE,
-            )
             plugin_dispatcher.dispatch("server.startup", startup_ctx, startup_plugin_list)
-            logger.info("Server startup hooks complete.")
         else:
             logger.info(
                 "No server plugins configured. "
                 "Add plugins under server.plugins in config.yml to register routes."
             )
+
+        # Fire server.startup for context plugins declared on roles (e.g. conversational_memory).
+        # These are not in server.plugins, so the loop above never reaches them — but they
+        # may need to resolve resources at startup (e.g. cache MCP endpoint details).
+        _fire_role_context_startup_hooks(startup_ctx)
+
+        logger.info("Server startup hooks complete.")
     else:
         logger.info(
             "No config loaded — serving /health only. "
@@ -73,6 +79,47 @@ async def lifespan(app: FastAPI):
     yield
     # ── Shutdown ────────────────────────────────────────────────────────────
     # Nothing to clean up in core — plugins handle their own teardown (future)
+
+
+def _fire_role_context_startup_hooks(startup_ctx: "StartupCtx") -> None:
+    """
+    Walk all role context plugin declarations and fire server.startup for any
+    plugin that supports it. Deduped by (plugin_name, resource) so the same
+    resource is only initialised once even if shared across multiple roles.
+    """
+    from . import plugin_loader
+
+    server_cfg = get_server_cfg()
+    roles = server_cfg.get("roles", {}) or {}
+    seen: set[tuple] = set()  # (plugin_name, resource_key) — dedup across roles
+
+    for role_key, role_cfg in roles.items():
+        if not role_cfg:
+            continue
+        context_plugins = _extract_plugin_list(
+            role_cfg.get("context", {}).get("plugins")
+        )
+        for plugin_name, plugin_config in context_plugins:
+            plugin = plugin_loader.get_plugin(plugin_name)
+            if plugin is None:
+                continue
+            if "server.startup" not in getattr(plugin, "SUPPORTED_HOOKS", []):
+                continue
+            dedup_key = (plugin_name, plugin_config.get("resource", ""))
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            logger.info(
+                f"Firing server.startup for context plugin '{plugin_name}' "
+                f"(role '{role_key}')"
+            )
+            try:
+                plugin.hook("server.startup", startup_ctx, plugin_config)
+            except Exception as e:
+                logger.error(
+                    f"server.startup: context plugin '{plugin_name}' raised: {e}",
+                    exc_info=True,
+                )
 
 
 app = FastAPI(

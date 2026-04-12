@@ -112,6 +112,7 @@ class PipelineCtx:
       identities.*.plugins          → "identity"
       identities.*.context.plugins  → "identity.context"
       roles.*.context.plugins       → "role.context"
+      (post-response, auto-collected) → "response.out"
     """
 
     # ── Resolved identity chain (set before pipeline starts) ────────────────
@@ -159,6 +160,21 @@ class PipelineCtx:
     Sanitised inbound headers from the client.
     Keys are lowercased. Hop-by-hop headers are stripped at intake.
     Pass-through headers (x-openclaw-*, etc.) are preserved here.
+    """
+
+    # ── Backend response (populated after forward, before response.out hook) ──
+    response: dict | None = None
+    """
+    The agent turn from the backend response. Populated by the pipeline after
+    the upstream call completes, before the response.out hook fires.
+
+    Shape: {"role": "assistant", "content": "<full response text>"}
+
+    None if:
+    - The response could not be parsed (non-OpenAI envelope)
+    - SSE stream reassembly failed
+
+    Plugins handling "response.out" should check for None before accessing.
     """
 
 
